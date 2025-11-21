@@ -1,0 +1,28 @@
+<launch>
+  <arg name="M4_scan_topic"           default="/scan"/>
+  <arg name="M4_lookahead"            default="0.8"/>   <arg name="M4_free_thresh"          default="0.5"/>   <arg name="M4_roi_front"            default="1.5"/>   <arg name="M4_roi_half_width"       default="0.6"/>   <arg name="M4_bias_to_heading"      default="0.5"/>   <arg name="M4_obstacle_dist_thresh" default="0.8"/>   <arg name="M4_min_gap_width"        default="0.35"/>  <arg name="M4_wheelbase"      default="0.2"/>   <arg name="M4_control_lookahead"      default="0.8"/>   <arg name="M4_linear_speed"   default="0.1"/>   <node pkg="limo_mission" 
+        type="mission4_perception.py" 
+        name="mission4_perception_node" 
+        output="screen">
+        
+    <param name="scan_topic"           value="$(arg M4_scan_topic)"/>
+    <param name="lookahead"            value="$(arg M4_lookahead)"/>
+    <param name="free_thresh"          value="$(arg M4_free_thresh)"/>
+    <param name="roi_front"            value="$(arg M4_roi_front)"/>
+    <param name="roi_half_width"       value="$(arg M4_roi_half_width)"/>
+    <param name="bias_to_heading"      value="$(arg M4_bias_to_heading)"/>
+    <param name="obstacle_dist_thresh" value="$(arg M4_obstacle_dist_thresh)"/>
+    <param name="min_gap_width"        value="$(arg M4_min_gap_width)"/>
+  </node>
+  
+  <node pkg="limo_mission" 
+        type="mission4_control.py" 
+        name="mission4_control_node" 
+        output="screen">
+        
+    <param name="wheelbase"     value="$(arg M4_wheelbase)"/>
+    <param name="lookahead"     value="$(arg M4_control_lookahead)"/>
+    <param name="linear_speed"  value="$(arg M4_linear_speed)"/>
+  </node>
+  
+</launch>
