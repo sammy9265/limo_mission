@@ -1,0 +1,28 @@
+<launch>
+  <arg name="M4_scan_topic"           default="/scan"/>
+  <arg name="M4_obstacle_threshold"   default="1.8"/>   
+  <arg name="M4_robot_width"          default="0.35"/>  
+  <arg name="M4_scan_angle_deg"       default="150.0"/> 
+
+  <arg name="M4_wheelbase"            default="0.2"/>   <arg name="M4_lookahead"            default="0.8"/>   <arg name="M4_linear_speed"         default="0.12"/>  <node pkg="limo_mission" 
+        type="mission4_perception.py" 
+        name="mission4_perception_node" 
+        output="screen">
+        
+    <param name="scan_topic"           value="$(arg M4_scan_topic)"/>
+    <param name="obstacle_threshold_m" value="$(arg M4_obstacle_threshold)"/>
+    <param name="robot_width_m"        value="$(arg M4_robot_width)"/>
+    <param name="scan_angle_deg"       value="$(arg M4_scan_angle_deg)"/>
+    </node>
+  
+  <node pkg="limo_mission" 
+        type="mission4_control.py" 
+        name="mission4_control_node" 
+        output="screen">
+        
+    <param name="wheelbase"     value="$(arg M4_wheelbase)"/>
+    <param name="lookahead"     value="$(arg M4_lookahead)"/>
+    <param name="linear_speed"  value="$(arg M4_linear_speed)"/>
+  </node>
+  
+</launch>
