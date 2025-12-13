@@ -7,32 +7,29 @@ import numpy as np
 import math
 from sensor_msgs.msg import CompressedImage, LaserScan
 from geometry_msgs.msg import Twist
-from cv_bridge import CvBridge
 
-class MissionFinalIntegrated:
+class MissionIntegratedFinal:
     def __init__(self):
-        rospy.init_node('mission_final_integrated', anonymous=False)
+        rospy.init_node('mission_integrated_final', anonymous=False)
         
         # === [ROS 통신 설정] ===
         self.pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
         
-        # 카메라 토픽 (통합본 기준: usb_cam 사용)
-        self.sub_img = rospy.Subscriber('/usb_cam/image_raw/compressed', 
+        # 카메라 토픽 구독
+        self.sub_img = rospy.Subscriber('/camera/rgb/image_raw/compressed', 
                                         CompressedImage, self.img_callback, queue_size=1)
-        # 라이다 토픽
+        # 라이다 토픽 구독
         self.sub_scan = rospy.Subscriber('/scan', LaserScan, self.scan_callback, queue_size=1)
-        
-        self.bridge = CvBridge()
 
         # === [상태 관리 변수] ===
         self.mode = "CAM"   # 현재 모드 (CAM, LIDAR, RECOVER)
-        self.start_time = rospy.Time.now().to_sec()  # 시작 시간
-        self.force_cam_duration = 15.0               # 15초간 강제 카메라 모드
+        self.start_time = rospy.Time.now().to_sec()  # 시작 시간 기록
+        self.force_cam_duration = 15.0               # 초반 15초 강제 카메라 모드
 
         # === [1. 카메라 설정 (Priority Avoidance)] ===
         self.img_width = 320
         self.img_height = 240
-        self.cam_speed = 0.22         # 카메라 주행 속도
+        self.cam_speed = 0.2          # 카메라 주행 속도
         self.roi_ratio = 0.4
         self.roi_h = int(self.img_height * self.roi_ratio)
         
@@ -72,9 +69,9 @@ class MissionFinalIntegrated:
         self.recover_dir = 0
         self.recover_rot_speed = 0.4
 
-        rospy.loginfo("===== Final Integrated Mission Started =====")
-        rospy.loginfo(f"1. Force Camera Mode for {self.force_cam_duration} seconds")
-        rospy.loginfo("2. Then Dynamic Mode (Camera <-> Lidar)")
+        rospy.loginfo("===== Integrated Mission Started =====")
+        rospy.loginfo(f"1. Force Camera Mode for {self.force_cam_duration}s")
+        rospy.loginfo("2. Then Auto Switch (Camera <-> Lidar)")
 
     # ==========================================================
     # 1. 카메라 콜백 (CAM 모드일 때 작동)
@@ -82,7 +79,8 @@ class MissionFinalIntegrated:
     # ==========================================================
     def img_callback(self, msg):
         # LIDAR나 RECOVER 모드일 때는 카메라는 잠시 쉰다
-        if self.mode not in ["CAM", "FORCE_CAM"]: 
+        # 단, FORCE_CAM 상태일 때는 무조건 실행
+        if self.mode != "CAM" and self.mode != "FORCE_CAM": 
             return
 
         try:
@@ -91,6 +89,7 @@ class MissionFinalIntegrated:
             img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             img = cv2.resize(img, (self.img_width, self.img_height))
             
+            # 전처리
             blur = cv2.GaussianBlur(img, (5, 5), 0)
             hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
             roi = hsv[self.img_height - self.roi_h:, :]
@@ -110,16 +109,11 @@ class MissionFinalIntegrated:
             center_x = w // 2
 
             # [우선순위 회피 로직]
-            # 왼쪽/오른쪽 무게를 비교해서 반대쪽으로 회전 (Repulsive Force)
-            
             # 1순위: 빨간색 회피
             if cnt_red > self.detect_thresh:
                 left = cv2.countNonZero(mask_red[:, :center_x])
                 right = cv2.countNonZero(mask_red[:, center_x:])
-                # 오른쪽이 많으면(양수) -> 왼쪽으로 회전(양수 angular) ...? 
-                # 공식: error = right - left
-                # 예: right(100) - left(0) = 100 -> +회전(좌회전). 
-                # LIMO는 +가 좌회전이므로 장애물이 오른쪽에 있으면 왼쪽으로 감. (OK)
+                # 오른쪽이 많으면(양수) -> 왼쪽으로 회전(양수 angular) 
                 twist.angular.z = (right - left) * self.gain_red
 
             # 2순위: 흰색 회피
@@ -128,7 +122,7 @@ class MissionFinalIntegrated:
                 right = cv2.countNonZero(mask_white[:, center_x:])
                 twist.angular.z = (right - left) * self.gain_white
             
-            # 3순위: 직진
+            # 3순위: 장애물 없으면 직진
             else:
                 twist.angular.z = 0.0
 
@@ -137,21 +131,22 @@ class MissionFinalIntegrated:
             self.pub.publish(twist)
 
         except Exception as e:
-            rospy.logwarn(f"Img Error: {e}")
+            rospy.logwarn_throttle(1, f"Img Error: {e}")
 
     # ==========================================================
     # 2. 라이다 콜백
-    #    기능 1: 시간 체크 및 모드 전환
-    #    기능 2: LIDAR 모드일 때 Gap Follower 주행
-    #    기능 3: 충돌 감지 시 RECOVER 모드 실행
+    #    기능: 모드 전환 판단 + LIDAR 주행 + 충돌 감지
     # ==========================================================
     def scan_callback(self, msg):
         # --- [A] 15초 강제 카메라 모드 로직 ---
+        # 시작 시간이 0이면 현재 시간으로 설정 (혹시 모를 에러 방지)
+        if self.start_time == 0: self.start_time = rospy.Time.now().to_sec()
+        
         elapsed = rospy.Time.now().to_sec() - self.start_time
+        
         if elapsed < self.force_cam_duration:
             self.mode = "FORCE_CAM"
-            # 15초 안 지났으면 라이다 로직은 무시하고 리턴
-            return 
+            return  # 15초 안 지났으면 라이다 로직 무시 (카메라가 운전함)
 
         # --- [B] 라이다 데이터 전처리 ---
         ranges = np.array(msg.ranges)
@@ -159,7 +154,7 @@ class MissionFinalIntegrated:
         ranges[np.isnan(ranges)] = 10.0
         ranges[ranges < 0.1] = 10.0
 
-        # 정면 거리 (모드 전환용)
+        # 정면 거리 측정 (모드 전환 판단용)
         mid = len(ranges) // 2
         front_indices = ranges[mid-20 : mid+20]
         front_min = np.min(front_indices) if len(front_indices) > 0 else 10.0
@@ -167,7 +162,7 @@ class MissionFinalIntegrated:
         # --- [C] 후진(Recover) 처리 ---
         if self.mode == "RECOVER":
             if rospy.Time.now().to_sec() - self.recover_start_time > self.recover_duration:
-                rospy.loginfo("[RECOVER] Done. Gap Follow.")
+                rospy.loginfo("[RECOVER] Done. Go Lidar.")
                 self.mode = "LIDAR"
             else:
                 twist = Twist()
@@ -209,7 +204,7 @@ class MissionFinalIntegrated:
         # --- [E] 라이다 주행 로직 (Gap Follower) ---
         # LIDAR 모드일 때만 실행됨
         
-        # 1. 데이터 추출
+        # 1. 데이터 추출 (시야각 제한 등)
         scan_data = []
         angle_min = msg.angle_min
         angle_inc = msg.angle_increment
@@ -300,7 +295,7 @@ class MissionFinalIntegrated:
 
 if __name__ == '__main__':
     try:
-        MissionFinalIntegrated()
+        MissionIntegratedFinal()
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
