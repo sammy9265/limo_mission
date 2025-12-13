@@ -24,10 +24,6 @@ class MissionIntegratedFinal:
         self.force_cam_duration = 15.0 
         self.lidar_done = False  
 
-        # ★ [추가된 변수] 복귀 딜레이 타이머
-        self.clear_start_time = 0
-        self.clear_wait_time = 2.0  # 2초 딜레이
-
         # === [1. 카메라 설정] ===
         self.img_width = 320
         self.img_height = 240
@@ -64,9 +60,9 @@ class MissionIntegratedFinal:
         self.recover_dir = 0
         self.recover_rot_speed = 0.4
 
-        rospy.loginfo("===== Mission Final: 2s Delay Return =====")
+        rospy.loginfo("===== Mission Final: Immediate Return =====")
         rospy.loginfo(f"1. Force Camera: {self.force_cam_duration}s")
-        rospy.loginfo("2. Lidar -> Cam: Wait 2.0s after clear")
+        rospy.loginfo("2. Lidar -> Cam: SWITCH IMMEDIATELY")
 
     # ==========================================================
     # 1. 카메라 콜백
@@ -166,24 +162,14 @@ class MissionIntegratedFinal:
             if self.mode == "CAM": return
 
         elif self.mode == "LIDAR":
-            # ★ [수정] 2초 딜레이 로직 ★
+            # ★ [복구] 즉시 전환 로직 ★
             if front_min > (self.trigger_dist + 0.2): 
-                # 처음으로 뚫렸으면 시간 측정 시작
-                if self.clear_start_time == 0:
-                    self.clear_start_time = rospy.Time.now().to_sec()
-                    rospy.loginfo("Path Clear! Waiting 2s...")
+                rospy.loginfo(f"!!! PATH CLEAR ({front_min:.2f}m) -> IMMEDIATE SWITCH TO CAM !!!")
+                rospy.loginfo("!!! LOCKING TO CAM MODE FOREVER !!!")
                 
-                # 뚫린 상태로 2초가 지났는지 확인
-                waited_time = rospy.Time.now().to_sec() - self.clear_start_time
-                if waited_time >= self.clear_wait_time:
-                    rospy.loginfo(f"!!! 2s PASSED ({front_min:.2f}m) -> SWITCH TO CAM !!!")
-                    self.mode = "CAM"
-                    self.lidar_done = True 
-                    self.clear_start_time = 0
-                    return
-            else:
-                # 다시 막히면 타이머 리셋
-                self.clear_start_time = 0
+                self.mode = "CAM"
+                self.lidar_done = True 
+                return
 
         # [E] 라이다 주행 (Gap Follower)
         scan_data = []
