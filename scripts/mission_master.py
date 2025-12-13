@@ -25,6 +25,9 @@ class MissionIntegratedFinal:
         self.mode = "CAM"   # 현재 모드 (CAM, LIDAR, RECOVER)
         self.start_time = rospy.Time.now().to_sec()  # 시작 시간 기록
         self.force_cam_duration = 15.0               # 초반 15초 강제 카메라 모드
+        
+        # ★ [핵심 수정] 라이다 미션 완료 여부 플래그
+        self.lidar_done = False  
 
         # === [1. 카메라 설정 (Priority Avoidance)] ===
         self.img_width = 320
@@ -69,13 +72,12 @@ class MissionIntegratedFinal:
         self.recover_dir = 0
         self.recover_rot_speed = 0.4
 
-        rospy.loginfo("===== Integrated Mission Started =====")
+        rospy.loginfo("===== Integrated Mission Started (One-Shot Lidar) =====")
         rospy.loginfo(f"1. Force Camera Mode for {self.force_cam_duration}s")
-        rospy.loginfo("2. Then Auto Switch (Camera <-> Lidar)")
+        rospy.loginfo("2. Lidar Mission triggers ONLY ONCE")
 
     # ==========================================================
     # 1. 카메라 콜백 (CAM 모드일 때 작동)
-    #    기능: 흰색 선과 빨간색 라바콘을 '피하는' 로직
     # ==========================================================
     def img_callback(self, msg):
         # LIDAR나 RECOVER 모드일 때는 카메라는 잠시 쉰다
@@ -113,7 +115,6 @@ class MissionIntegratedFinal:
             if cnt_red > self.detect_thresh:
                 left = cv2.countNonZero(mask_red[:, :center_x])
                 right = cv2.countNonZero(mask_red[:, center_x:])
-                # 오른쪽이 많으면(양수) -> 왼쪽으로 회전(양수 angular) 
                 twist.angular.z = (right - left) * self.gain_red
 
             # 2순위: 흰색 회피
@@ -135,18 +136,15 @@ class MissionIntegratedFinal:
 
     # ==========================================================
     # 2. 라이다 콜백
-    #    기능: 모드 전환 판단 + LIDAR 주행 + 충돌 감지
     # ==========================================================
     def scan_callback(self, msg):
         # --- [A] 15초 강제 카메라 모드 로직 ---
-        # 시작 시간이 0이면 현재 시간으로 설정 (혹시 모를 에러 방지)
         if self.start_time == 0: self.start_time = rospy.Time.now().to_sec()
-        
         elapsed = rospy.Time.now().to_sec() - self.start_time
         
         if elapsed < self.force_cam_duration:
             self.mode = "FORCE_CAM"
-            return  # 15초 안 지났으면 라이다 로직 무시 (카메라가 운전함)
+            return  # 15초 안 지났으면 라이다 로직 무시
 
         # --- [B] 라이다 데이터 전처리 ---
         ranges = np.array(msg.ranges)
@@ -154,7 +152,7 @@ class MissionIntegratedFinal:
         ranges[np.isnan(ranges)] = 10.0
         ranges[ranges < 0.1] = 10.0
 
-        # 정면 거리 측정 (모드 전환 판단용)
+        # 정면 거리 측정
         mid = len(ranges) // 2
         front_indices = ranges[mid-20 : mid+20]
         front_min = np.min(front_indices) if len(front_indices) > 0 else 10.0
@@ -174,27 +172,34 @@ class MissionIntegratedFinal:
 
         # --- [D] 모드 전환 로직 (CAM <-> LIDAR) ---
         if self.mode == "CAM" or self.mode == "FORCE_CAM":
-            # 15초 지났고, CAM 모드인데 장애물이 가까우면 -> LIDAR 모드
+            # ★ [핵심 수정] 이미 라이다 미션을 했으면(True), 절대 다시 전환하지 않음 ★
+            if self.lidar_done:
+                return 
+
+            # 장애물이 가까우면 -> LIDAR 모드 진입
             if front_min < self.trigger_dist:
                 self.trigger_count += 1
                 if self.trigger_count >= self.trigger_limit:
-                    rospy.logwarn(f"!!! OBSTACLE ({front_min:.2f}m) -> LIDAR MODE !!!")
+                    rospy.logwarn(f"!!! OBSTACLE ({front_min:.2f}m) -> LIDAR MODE START !!!")
                     self.mode = "LIDAR"
                     self.trigger_count = 0
                     self.clear_count = 0
             else:
                 self.trigger_count = 0
             
-            # CAM 모드일 때는 여기서 끝 (주행은 img_callback이 함)
             if self.mode == "CAM": return
 
         elif self.mode == "LIDAR":
-            # 장애물이 사라지면 -> CAM 모드
+            # 장애물이 사라지면 -> CAM 모드 복귀 + ★ [미션 완료 처리] ★
             if front_min > (self.trigger_dist + 0.2): 
                 self.clear_count += 1
                 if self.clear_count >= self.clear_limit:
-                    rospy.loginfo(f"!!! PATH CLEAR ({front_min:.2f}m) -> CAM MODE !!!")
+                    rospy.loginfo(f"!!! PATH CLEAR ({front_min:.2f}m) -> LIDAR MISSION COMPLETE !!!")
+                    rospy.loginfo("!!! LOCKING TO CAM MODE FOREVER !!!")
+                    
                     self.mode = "CAM"
+                    self.lidar_done = True  # <--- 이제 다시는 LIDAR로 안 바뀜
+                    
                     self.clear_count = 0
                     self.trigger_count = 0
                     return
@@ -204,7 +209,6 @@ class MissionIntegratedFinal:
         # --- [E] 라이다 주행 로직 (Gap Follower) ---
         # LIDAR 모드일 때만 실행됨
         
-        # 1. 데이터 추출 (시야각 제한 등)
         scan_data = []
         angle_min = msg.angle_min
         angle_inc = msg.angle_increment
@@ -217,22 +221,19 @@ class MissionIntegratedFinal:
             angle = angle_min + i * angle_inc
             deg = math.degrees(angle)
             
-            # 전방 10도 거리
             if abs(deg) < 10:
                 if r < path_clear_dist: path_clear_dist = r
 
-            # 코너 감지
             if 20 < deg < 60:
                 if r < left_corner_min: left_corner_min = r
             elif -60 < deg < -20:
                 if r < right_corner_min: right_corner_min = r
             
-            # Gap Finding용 데이터 (뒤쪽 제외, 시야각 제한)
             if abs(deg) > 90: continue
             if self.view_limit_right < deg < self.view_limit_left:
                 scan_data.append((angle, min(r, 3.0)))
 
-        # 2. 충돌 감지 -> RECOVER 전환
+        # 충돌 감지 -> RECOVER 전환
         current_safe_limit = self.corner_safe_dist_default
         if path_clear_dist > 0.4:
             current_safe_limit = self.corner_safe_dist_narrow
@@ -250,7 +251,7 @@ class MissionIntegratedFinal:
             self.recover_start_time = rospy.Time.now().to_sec()
             return
 
-        # 3. Gap Finding (빈 공간 찾기)
+        # Gap Finding
         scan_data.sort(key=lambda x: x[0])
         max_gap_len = 0
         best_gap_center = 0.0
@@ -276,20 +277,19 @@ class MissionIntegratedFinal:
             best_gap_center = scan_data[(s+e)//2][0]
             max_gap_len = current_len
 
-        # 4. 주행 명령 발행
+        # 주행 명령
         twist = Twist()
         if max_gap_len > 5:
             twist.linear.x = self.gap_speed
             twist.angular.z = self.gap_kp * best_gap_center
             
-            # 코너 보정
             if right_corner_min < 0.30: twist.angular.z += 0.3
             elif left_corner_min < 0.30: twist.angular.z -= 0.3
             
             twist.angular.z = np.clip(twist.angular.z, -1.2, 1.2)
         else:
             twist.linear.x = 0.0
-            twist.angular.z = -0.6 # 제자리 회전
+            twist.angular.z = -0.6
             
         self.pub.publish(twist)
 
