@@ -14,55 +14,47 @@ class MissionIntegratedFinal:
         
         # === [ROS 통신 설정] ===
         self.pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-        
-        # 카메라 토픽 구독
         self.sub_img = rospy.Subscriber('/camera/rgb/image_raw/compressed', 
                                         CompressedImage, self.img_callback, queue_size=1)
-        # 라이다 토픽 구독
         self.sub_scan = rospy.Subscriber('/scan', LaserScan, self.scan_callback, queue_size=1)
 
         # === [상태 관리 변수] ===
-        self.mode = "CAM"   # 현재 모드 (CAM, LIDAR, RECOVER)
-        self.start_time = rospy.Time.now().to_sec()  # 시작 시간 기록
-        self.force_cam_duration = 15.0               # 초반 15초 강제 카메라 모드
-        
-        # ★ [핵심 수정] 라이다 미션 완료 여부 플래그
+        self.mode = "CAM"   
+        self.start_time = rospy.Time.now().to_sec()
+        self.force_cam_duration = 15.0 
         self.lidar_done = False  
 
-        # === [1. 카메라 설정 (Priority Avoidance)] ===
+        # ★ [추가된 변수] 복귀 딜레이 타이머
+        self.clear_start_time = 0
+        self.clear_wait_time = 2.0  # 2초 딜레이
+
+        # === [1. 카메라 설정] ===
         self.img_width = 320
         self.img_height = 240
-        self.cam_speed = 0.2          # 카메라 주행 속도
+        self.cam_speed = 0.2          
         self.roi_ratio = 0.4
         self.roi_h = int(self.img_height * self.roi_ratio)
         
-        # 색상 임계값 (피해야 할 대상)
         self.lower_white = np.array([0, 0, 160]);     self.upper_white = np.array([179, 30, 255])
         self.lower_red1 = np.array([0, 100, 50]);     self.upper_red1 = np.array([10, 255, 255])
         self.lower_red2 = np.array([170, 100, 50]);   self.upper_red2 = np.array([180, 255, 255])
 
-        # 카메라 회피 게인
         self.gain_white = 0.005
         self.gain_red = 0.008
         self.detect_thresh = 50
 
-        # === [2. 라이다 설정 (Gap Follower)] ===
-        self.gap_speed = 0.22         # 라이다 주행 속도
-        self.gap_kp = 1.5             # 조향 게인
+        # === [2. 라이다 설정] ===
+        self.gap_speed = 0.22         
+        self.gap_kp = 1.5             
         
-        # 모드 전환 트리거
-        self.trigger_dist = 1.0       # 이 거리 안에 장애물 있으면 라이다 모드
-        self.trigger_count = 0        # 필터링 카운터
-        self.trigger_limit = 5
-        self.clear_count = 0
-        self.clear_limit = 10
+        self.trigger_dist = 1.0       
+        self.trigger_count = 0        
+        self.trigger_limit = 5        
 
-        # 라이다 주행 파라미터
         self.safe_dist = 1.0
         self.view_limit_left = 15.0 
         self.view_limit_right = -80.0
         
-        # 충돌 감지 및 후진
         self.corner_safe_dist_default = 0.25 
         self.corner_safe_dist_narrow = 0.12 
         self.wall_ignore_y = 0.5
@@ -72,31 +64,26 @@ class MissionIntegratedFinal:
         self.recover_dir = 0
         self.recover_rot_speed = 0.4
 
-        rospy.loginfo("===== Integrated Mission Started (One-Shot Lidar) =====")
-        rospy.loginfo(f"1. Force Camera Mode for {self.force_cam_duration}s")
-        rospy.loginfo("2. Lidar Mission triggers ONLY ONCE")
+        rospy.loginfo("===== Mission Final: 2s Delay Return =====")
+        rospy.loginfo(f"1. Force Camera: {self.force_cam_duration}s")
+        rospy.loginfo("2. Lidar -> Cam: Wait 2.0s after clear")
 
     # ==========================================================
-    # 1. 카메라 콜백 (CAM 모드일 때 작동)
+    # 1. 카메라 콜백
     # ==========================================================
     def img_callback(self, msg):
-        # LIDAR나 RECOVER 모드일 때는 카메라는 잠시 쉰다
-        # 단, FORCE_CAM 상태일 때는 무조건 실행
         if self.mode != "CAM" and self.mode != "FORCE_CAM": 
             return
 
         try:
-            # 이미지 디코딩 및 리사이징
             np_arr = np.frombuffer(msg.data, np.uint8)
             img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             img = cv2.resize(img, (self.img_width, self.img_height))
             
-            # 전처리
             blur = cv2.GaussianBlur(img, (5, 5), 0)
             hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
             roi = hsv[self.img_height - self.roi_h:, :]
             
-            # 마스크 생성 (빨강, 흰색)
             mask_r1 = cv2.inRange(roi, self.lower_red1, self.upper_red1)
             mask_r2 = cv2.inRange(roi, self.lower_red2, self.upper_red2)
             mask_red = cv2.bitwise_or(mask_r1, mask_r2)
@@ -110,24 +97,18 @@ class MissionIntegratedFinal:
             h, w = roi.shape[:2]
             center_x = w // 2
 
-            # [우선순위 회피 로직]
-            # 1순위: 빨간색 회피
             if cnt_red > self.detect_thresh:
                 left = cv2.countNonZero(mask_red[:, :center_x])
                 right = cv2.countNonZero(mask_red[:, center_x:])
                 twist.angular.z = (right - left) * self.gain_red
 
-            # 2순위: 흰색 회피
             elif cnt_white > self.detect_thresh:
                 left = cv2.countNonZero(mask_white[:, :center_x])
                 right = cv2.countNonZero(mask_white[:, center_x:])
                 twist.angular.z = (right - left) * self.gain_white
-            
-            # 3순위: 장애물 없으면 직진
             else:
                 twist.angular.z = 0.0
 
-            # 조향 제한
             twist.angular.z = max(min(twist.angular.z, 1.5), -1.5)
             self.pub.publish(twist)
 
@@ -138,26 +119,25 @@ class MissionIntegratedFinal:
     # 2. 라이다 콜백
     # ==========================================================
     def scan_callback(self, msg):
-        # --- [A] 15초 강제 카메라 모드 로직 ---
+        # [A] 15초 강제 카메라
         if self.start_time == 0: self.start_time = rospy.Time.now().to_sec()
         elapsed = rospy.Time.now().to_sec() - self.start_time
         
         if elapsed < self.force_cam_duration:
             self.mode = "FORCE_CAM"
-            return  # 15초 안 지났으면 라이다 로직 무시
+            return 
 
-        # --- [B] 라이다 데이터 전처리 ---
+        # [B] 전처리
         ranges = np.array(msg.ranges)
         ranges[np.isinf(ranges)] = 10.0
         ranges[np.isnan(ranges)] = 10.0
         ranges[ranges < 0.1] = 10.0
 
-        # 정면 거리 측정
         mid = len(ranges) // 2
         front_indices = ranges[mid-20 : mid+20]
         front_min = np.min(front_indices) if len(front_indices) > 0 else 10.0
 
-        # --- [C] 후진(Recover) 처리 ---
+        # [C] 후진 처리
         if self.mode == "RECOVER":
             if rospy.Time.now().to_sec() - self.recover_start_time > self.recover_duration:
                 rospy.loginfo("[RECOVER] Done. Go Lidar.")
@@ -170,45 +150,42 @@ class MissionIntegratedFinal:
                 self.pub.publish(twist)
             return
 
-        # --- [D] 모드 전환 로직 (CAM <-> LIDAR) ---
+        # [D] 모드 전환 로직
         if self.mode == "CAM" or self.mode == "FORCE_CAM":
-            # ★ [핵심 수정] 이미 라이다 미션을 했으면(True), 절대 다시 전환하지 않음 ★
-            if self.lidar_done:
-                return 
+            if self.lidar_done: return 
 
-            # 장애물이 가까우면 -> LIDAR 모드 진입
             if front_min < self.trigger_dist:
                 self.trigger_count += 1
                 if self.trigger_count >= self.trigger_limit:
                     rospy.logwarn(f"!!! OBSTACLE ({front_min:.2f}m) -> LIDAR MODE START !!!")
                     self.mode = "LIDAR"
                     self.trigger_count = 0
-                    self.clear_count = 0
             else:
                 self.trigger_count = 0
             
             if self.mode == "CAM": return
 
         elif self.mode == "LIDAR":
-            # 장애물이 사라지면 -> CAM 모드 복귀 + ★ [미션 완료 처리] ★
+            # ★ [수정] 2초 딜레이 로직 ★
             if front_min > (self.trigger_dist + 0.2): 
-                self.clear_count += 1
-                if self.clear_count >= self.clear_limit:
-                    rospy.loginfo(f"!!! PATH CLEAR ({front_min:.2f}m) -> LIDAR MISSION COMPLETE !!!")
-                    rospy.loginfo("!!! LOCKING TO CAM MODE FOREVER !!!")
-                    
+                # 처음으로 뚫렸으면 시간 측정 시작
+                if self.clear_start_time == 0:
+                    self.clear_start_time = rospy.Time.now().to_sec()
+                    rospy.loginfo("Path Clear! Waiting 2s...")
+                
+                # 뚫린 상태로 2초가 지났는지 확인
+                waited_time = rospy.Time.now().to_sec() - self.clear_start_time
+                if waited_time >= self.clear_wait_time:
+                    rospy.loginfo(f"!!! 2s PASSED ({front_min:.2f}m) -> SWITCH TO CAM !!!")
                     self.mode = "CAM"
-                    self.lidar_done = True  # <--- 이제 다시는 LIDAR로 안 바뀜
-                    
-                    self.clear_count = 0
-                    self.trigger_count = 0
+                    self.lidar_done = True 
+                    self.clear_start_time = 0
                     return
             else:
-                self.clear_count = 0
+                # 다시 막히면 타이머 리셋
+                self.clear_start_time = 0
 
-        # --- [E] 라이다 주행 로직 (Gap Follower) ---
-        # LIDAR 모드일 때만 실행됨
-        
+        # [E] 라이다 주행 (Gap Follower)
         scan_data = []
         angle_min = msg.angle_min
         angle_inc = msg.angle_increment
@@ -233,25 +210,15 @@ class MissionIntegratedFinal:
             if self.view_limit_right < deg < self.view_limit_left:
                 scan_data.append((angle, min(r, 3.0)))
 
-        # 충돌 감지 -> RECOVER 전환
         current_safe_limit = self.corner_safe_dist_default
         if path_clear_dist > 0.4:
             current_safe_limit = self.corner_safe_dist_narrow
 
         if left_corner_min < current_safe_limit:
-            rospy.logwarn("Left Hit -> Backup")
-            self.mode = "RECOVER"
-            self.recover_dir = 1
-            self.recover_start_time = rospy.Time.now().to_sec()
-            return
+            self.mode = "RECOVER"; self.recover_dir = 1; self.recover_start_time = rospy.Time.now().to_sec(); return
         elif right_corner_min < current_safe_limit:
-            rospy.logwarn("Right Hit -> Backup")
-            self.mode = "RECOVER"
-            self.recover_dir = -1
-            self.recover_start_time = rospy.Time.now().to_sec()
-            return
+            self.mode = "RECOVER"; self.recover_dir = -1; self.recover_start_time = rospy.Time.now().to_sec(); return
 
-        # Gap Finding
         scan_data.sort(key=lambda x: x[0])
         max_gap_len = 0
         best_gap_center = 0.0
@@ -277,15 +244,12 @@ class MissionIntegratedFinal:
             best_gap_center = scan_data[(s+e)//2][0]
             max_gap_len = current_len
 
-        # 주행 명령
         twist = Twist()
         if max_gap_len > 5:
             twist.linear.x = self.gap_speed
             twist.angular.z = self.gap_kp * best_gap_center
-            
             if right_corner_min < 0.30: twist.angular.z += 0.3
             elif left_corner_min < 0.30: twist.angular.z -= 0.3
-            
             twist.angular.z = np.clip(twist.angular.z, -1.2, 1.2)
         else:
             twist.linear.x = 0.0
