@@ -13,23 +13,25 @@ class LineTracerWithObstacleAvoidance:
         rospy.init_node("line_tracer_with_obstacle_avoidance")
         self.pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
 
-        # 이미지 토픽 (CompressedImage 사용)
+        # ==========================================================
+        # [수정됨] 카메라 토픽 복구: /camera/rgb -> /usb_cam
+        # ==========================================================
         rospy.Subscriber("/usb_cam/image_raw/compressed", CompressedImage, self.camera_cb)
         rospy.Subscriber("/scan", LaserScan, self.lidar_cb)
 
         self.bridge = CvBridge()
 
         # ==========================================
-        # [설정] 빨간색 회피 주행 파라미터 (NEW)
+        # [설정] 빨간색 회피 주행 파라미터
         # ==========================================
-        self.red_thresh = 500          # 이 개수 이상 빨간점이 보이면 빨간색 모드 진입
-        self.red_gain = 0.01          # 빨간색 회피 조향 게인
-        self.red_speed = 0.2         # 빨간색 구간 속도
+        self.red_thresh = 500          # 빨간점 개수 임계값
+        self.red_gain = 0.005          # 빨간색 회피 조향 게인
+        self.red_speed = 0.12          # 빨간색 구간 속도
 
         # ==========================================
-        # [설정] 검은색 라인트레이싱 파라미터 (기존 로직 변경)
+        # [설정] 검은색 라인트레이싱 파라미터 (Code 2 기반)
         # ==========================================
-        self.forward_speed = 0.2      # 기본 전진 속도
+        self.forward_speed = 0.12      # 기본 전진 속도
         self.search_spin_speed = 0.25  # 라인 못 찾을 때 회전 속도
         self.k_angle = 0.010           # 조향 게인
         self.dark_min_pixels = 5       # 최소 검은색 픽셀 수
@@ -102,7 +104,7 @@ class LineTracerWithObstacleAvoidance:
                 roi_gray = cv2.cvtColor(img[h - roi_h:, :], cv2.COLOR_BGR2GRAY) # 검은색용 (Gray)
 
                 # --------------------------------------------------
-                # [PRIORITY 1] 빨간색 감지 및 회피 (Avoidance)
+                # [PRIORITY 1] 빨간색 감지 및 회피 (Code 1 로직 유지)
                 # --------------------------------------------------
                 lower_red1 = np.array([0, 100, 50]);  upper_red1 = np.array([10, 255, 255])
                 lower_red2 = np.array([170, 100, 50]); upper_red2 = np.array([180, 255, 255])
@@ -120,9 +122,7 @@ class LineTracerWithObstacleAvoidance:
                     left_mass = cv2.countNonZero(mask_red[:, :cx])
                     right_mass = cv2.countNonZero(mask_red[:, cx:])
 
-                    # [회피 논리]
-                    # 오른쪽 빨강이 많음(양수) -> 왼쪽으로 회전(Turn Left, +z)
-                    # 왼쪽 빨강이 많음(음수) -> 오른쪽으로 회전(Turn Right, -z)
+                    # [회피 논리] 오른쪽 빨강 많음 -> 왼쪽 회전 / 왼쪽 빨강 많음 -> 오른쪽 회전
                     error = right_mass - left_mass
                     
                     steer = error * self.red_gain
@@ -134,14 +134,14 @@ class LineTracerWithObstacleAvoidance:
                     return # 빨간색 처리했으므로 검은색 로직 실행 안함 (return)
 
                 # --------------------------------------------------
-                # [PRIORITY 2] 검은색 트랙 추종 (Line Following)
+                # [PRIORITY 2] 검은색 트랙 추종 (Code 2 로직 적용)
                 # --------------------------------------------------
                 
                 # 검은색 트랙 강조: THRESH_BINARY_INV + OTSU
                 # (검은색 라인이 흰색(255)으로 변환됨)
                 _, binary = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-                # 노이즈 제거
+                # 노이즈 제거 (Morphology)
                 kernel = np.ones((3, 3), np.uint8)
                 binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
                 binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
@@ -175,11 +175,14 @@ class LineTracerWithObstacleAvoidance:
 
                 # [추종 논리]
                 # 라인이 화면 중심보다 오른쪽(Positive offset) -> 오른쪽으로 회전해야 함 (-z)
+                # Code 2 로직: ang = -self.k_angle * offset
                 offset = track_center_x - center 
                 ang = -self.k_angle * offset
+                
+                # 조향값 제한 (-0.8 ~ 0.8)
                 ang = max(min(ang, 0.8), -0.8)
 
-                # 최종 주행 명령
+                # 최종 주행 명령 발행
                 twist.linear.x = self.forward_speed
                 twist.angular.z = ang
                 self.pub.publish(twist)
