@@ -26,12 +26,12 @@ class LineTracerWithObstacleAvoidance:
         # ==========================================
         self.red_thresh = 500          # 빨간점 개수 임계값
         self.red_gain = 0.005          # 빨간색 회피 조향 게인
-        self.red_speed = 0.12          # 빨간색 구간 속도
+        self.red_speed = 0.2          # 빨간색 구간 속도
 
         # ==========================================
         # [설정] 검은색 라인트레이싱 파라미터 (Code 2 기반)
         # ==========================================
-        self.forward_speed = 0.12      # 기본 전진 속도
+        self.forward_speed = 0.2      # 기본 전진 속도
         self.search_spin_speed = 0.25  # 라인 못 찾을 때 회전 속도
         self.k_angle = 0.010           # 조향 게인
         self.dark_min_pixels = 5       # 최소 검은색 픽셀 수
