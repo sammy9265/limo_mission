@@ -23,7 +23,7 @@ class LineTracerWithObstacleAvoidance:
         # [설정] 빨간색 회피 주행 파라미터 (NEW)
         # ==========================================
         self.red_thresh = 500          # 이 개수 이상 빨간점이 보이면 빨간색 모드 진입
-        self.red_gain = 0.005          # 빨간색 회피 조향 게인
+        self.red_gain = 0.01          # 빨간색 회피 조향 게인
         self.red_speed = 0.2         # 빨간색 구간 속도
 
         # ==========================================
