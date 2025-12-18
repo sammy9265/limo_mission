@@ -66,7 +66,8 @@ class LimoMissionIntegrated:
         self.recover_rot_speed = 0.4
 
         # === Subscribers ===
-        rospy.Subscriber('/usb_cam/image_raw/compressed', CompressedImage, self.image_callback)
+        # [수정됨] 카메라 토픽 변경: /usb_cam/... -> /camera/rgb/...
+        rospy.Subscriber('/camera/rgb/image_raw/compressed', CompressedImage, self.image_callback)
         rospy.Subscriber('/scan', LaserScan, self.scan_callback)
         
         # 종료 시 로봇 정지를 위한 hook 등록
