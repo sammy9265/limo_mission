@@ -4,266 +4,283 @@
 import rospy
 import cv2
 import numpy as np
+import math
 from sensor_msgs.msg import CompressedImage, LaserScan
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 
-class LineTracerWithObstacleAvoidance:
+class LimoMissionIntegrated:
     def __init__(self):
-        rospy.init_node("line_tracer_with_obstacle_avoidance")
-        self.pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
-
-        # ==========================================================
-        # [수정됨] 카메라 토픽 (/usb_cam -> /camera/rgb)
-        # ==========================================================
-        rospy.Subscriber("/camera/rgb/image_raw/compressed", CompressedImage, self.camera_cb)
-        rospy.Subscriber("/scan", LaserScan, self.lidar_cb)
-
+        rospy.init_node('limo_mission_integrated', anonymous=True)
+        
+        self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        
+        # === [설정] 상태 머신 ===
+        self.mode = "LINE"  # 초기 모드: 라인 트레이싱
+        
+        # === [설정] 장애물 감지 및 모드 전환 ===
+        self.trigger_dist = 1.0       # 이 거리 안에 장애물 있으면 감지 시작
+        self.trigger_count = 0        # 노이즈 필터링용 카운터
+        self.trigger_limit = 5        # 5번 연속 감지 시 모드 전환
+        
+        # === [설정] 라인 트레이싱 (새로운 로직) ===
         self.bridge = CvBridge()
+        self.line_speed = 0.3        # 라인 주행 속도
+        
+        # HSV 색상 범위 (검은색 + 노란색)
+        self.black_lower = np.array([102, 0, 60])
+        self.black_upper = np.array([164, 86, 136])
+        self.black2_lower = np.array([126, 25, 45])
+        self.black2_upper = np.array([167, 89, 108])
+        self.black3_lower = np.array([125, 29, 26])
+        self.black3_upper = np.array([171, 100, 78])
+        self.yellow_lower = np.array([14, 17, 153])
+        self.yellow_upper = np.array([35, 167, 255])
+        
+        # Bird's Eye View 파라미터
+        self.margin_x = 150
+        self.margin_y = 350
+        
+        # 조향 제어 (Smoothing)
+        self.steer_weight = 2.0
+        self.steer_alpha = 0.35
+        self.steer_max = 1.20
+        self.steer_rate = 0.14
+        self.steer = 0.0
+        self.steer_f = 0.0
 
-        # ==========================================
-        # [설정] 빨간색 회피 주행 파라미터
-        # ==========================================
-        self.red_thresh = 500          # 빨간점 개수 임계값
-        self.red_gain = 0.005          # 빨간색 회피 조향 게인
-        self.red_speed = 0.12          # 빨간색 구간 속도
+        # === [설정] Gap Follower (장애물 회피) ===
+        self.gap_speed = 0.22
+        self.gap_kp = 1.5
+        self.safe_dist = 1.0
+        self.view_limit_left = 15.0   
+        self.view_limit_right = -80.0 
+        
+        # === [설정] 충돌 감지 및 후진 ===
+        self.corner_safe_dist_default = 0.25  
+        self.corner_safe_dist_narrow = 0.12   
+        self.wall_ignore_y = 0.5
+        self.recover_start_time = 0
+        self.recover_duration = 1.5
+        self.recover_dir = 0
+        self.recover_rot_speed = 0.4
 
-        # ==========================================
-        # [설정] 검은색 라인트레이싱 파라미터 (Code 2 기반)
-        # ==========================================
-        self.forward_speed = 0.12      # 기본 전진 속도
-        self.search_spin_speed = 0.25  # 라인 못 찾을 때 회전 속도
-        self.k_angle = 0.010           # 조향 게인
-        self.dark_min_pixels = 5       # 최소 검은색 픽셀 수
-        self.dark_col_ratio = 0.3      # 임계값 비율
+        # === Subscribers ===
+        rospy.Subscriber('/usb_cam/image_raw/compressed', CompressedImage, self.image_callback)
+        rospy.Subscriber('/scan', LaserScan, self.scan_callback)
+        
+        # 종료 시 로봇 정지를 위한 hook 등록
+        rospy.on_shutdown(self.shutdown_hook)
 
-        # ==========================================
-        # [설정] LiDAR 및 상태 변수 (수정 금지)
-        # ==========================================
-        self.scan_ranges = []
-        self.front = 999.0
+        rospy.loginfo("===== LIMO Integrated Mission Started =====")
+        rospy.loginfo("Mode: LINE (Yellow/Black) -> Detect Obstacle -> Mode: GAP")
 
-        self.state = "LANE"
-        self.escape_angle = 0.0
-        self.state_start = rospy.Time.now().to_sec()
+    def shutdown_hook(self):
+        """노드 종료 시 로봇을 정지시킵니다."""
+        stop_twist = Twist()
+        self.cmd_pub.publish(stop_twist)
+        rospy.loginfo("LIMO Stopped.")
 
-        self.left_escape_count = 0
-        self.force_right_escape = 0
-        self.robot_width = 0.13    
+    # ---------------------------------------------------------
+    # 1. 라인 트레이싱 콜백
+    # ---------------------------------------------------------
+    def image_callback(self, msg):
+        if self.mode != "LINE": 
+            return # GAP 모드일 때는 카메라 무시
 
-    # ============================================================
-    # LIDAR (수정 금지)
-    # ============================================================
-    def lidar_cb(self, scan):
-        raw = np.array(scan.ranges)
-        self.scan_ranges = raw
+        try:
+            # CompressedImage -> OpenCV 변환
+            cv_img = self.bridge.compressed_imgmsg_to_cv2(msg)
+            y, x, _ = cv_img.shape
+            hsv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2HSV)
+            
+            # 1. 필터링
+            yellow_filter = cv2.inRange(hsv_img, self.yellow_lower, self.yellow_upper)
+            b1 = cv2.inRange(hsv_img, self.black_lower, self.black_upper)
+            b2 = cv2.inRange(hsv_img, self.black2_lower, self.black2_upper)
+            b3 = cv2.inRange(hsv_img, self.black3_lower, self.black3_upper)
+            black_filter = cv2.bitwise_or(b1, cv2.bitwise_or(b2, b3))
+            
+            # 노란색 or 검은색 인식
+            target_filter = cv2.bitwise_or(black_filter, yellow_filter)
 
-        front_zone = np.concatenate([raw[:10], raw[-10:]])
-        cleaned = [d for d in front_zone if d > 0.20 and not np.isnan(d)]
-        self.front = np.median(cleaned) if cleaned else 999.0
+            # 2. Bird's Eye View 변환
+            src_pts = np.float32([(30, y), (self.margin_x, self.margin_y), (x - self.margin_x, self.margin_y), (x - 30, y)])
+            dst_margin_x = 120
+            dst_pts = np.float32([(dst_margin_x, y), (dst_margin_x, 0), (x - dst_margin_x, 0), (x - dst_margin_x, y)])
+            matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            warp_img = cv2.warpPerspective(target_filter, matrix, (x, y))
 
-    # ============================================================
-    # CAMERA (우선순위: 빨간색 회피 -> 검은색 추종)
-    # ============================================================
-    def camera_cb(self, msg):
-        twist = Twist()
-        now = rospy.Time.now().to_sec()
-
-        # 1. ESCAPE 모드 (기존 유지)
-        if self.state == "ESCAPE":
-            self.escape_control()
-            return
-
-        # 2. BACK 모드 (기존 유지)
-        if self.state == "BACK":
-            self.back_control()
-            return
-
-        # 3. LANE 모드
-        if self.state == "LANE":
-
-            # [LiDAR Check] 장애물 감지 시 BACK 모드 (최우선 - 수정 금지)
-            if self.front < 0.45:
-                self.state = "BACK"
-                self.state_start = now
-                return
-
-            try:
-                # 이미지 변환
-                img = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
-                h, w = img.shape[:2]
-                center = w / 2.0
-
-                # 전처리: Blur & HSV
-                img_blur = cv2.GaussianBlur(img, (5, 5), 0)
-                hsv = cv2.cvtColor(img_blur, cv2.COLOR_BGR2HSV)
-
-                # ROI 설정 (하단부 50%)
-                roi_h = int(h * 0.5)
-                roi_hsv = hsv[h - roi_h:, :]                     # 빨간색용 (HSV)
-                roi_gray = cv2.cvtColor(img[h - roi_h:, :], cv2.COLOR_BGR2GRAY) # 검은색용 (Gray)
-
-                # --------------------------------------------------
-                # [PRIORITY 1] 빨간색 감지 및 회피 (Code 1 로직 유지)
-                # --------------------------------------------------
-                lower_red1 = np.array([0, 100, 50]);  upper_red1 = np.array([10, 255, 255])
-                lower_red2 = np.array([170, 100, 50]); upper_red2 = np.array([180, 255, 255])
+            # 3. 조향각 계산 (Moments)
+            M = cv2.moments(warp_img)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                error = (x // 2) - cx
                 
-                mask_r1 = cv2.inRange(roi_hsv, lower_red1, upper_red1)
-                mask_r2 = cv2.inRange(roi_hsv, lower_red2, upper_red2)
-                mask_red = cv2.bitwise_or(mask_r1, mask_r2)
+                steer_raw = (error * math.pi / x) * self.steer_weight
+                steer_raw = float(np.clip(steer_raw, -self.steer_max, self.steer_max))
 
-                red_count = cv2.countNonZero(mask_red)
+                # Smoothing
+                self.steer_f = (1.0 - self.steer_alpha) * self.steer_f + self.steer_alpha * steer_raw
+                d = self.steer_f - self.steer
+                d = float(np.clip(d, -self.steer_rate, self.steer_rate))
+                self.steer = float(np.clip(self.steer + d, -self.steer_max, self.steer_max))
+            else:
+                # 라인을 잃어버렸을 때 기존 조향 유지 (급격한 회전 방지)
+                self.steer = float(np.clip(self.steer, -0.45, 0.45))
 
-                # 빨간색이 일정량 이상 보이면 -> 빨간색 회피 로직 실행
-                if red_count > self.red_thresh:
-                    # 화면 좌우 분할하여 빨간색 양 비교
-                    cx = w // 2
-                    left_mass = cv2.countNonZero(mask_red[:, :cx])
-                    right_mass = cv2.countNonZero(mask_red[:, cx:])
+            # 주행 명령
+            twist = Twist()
+            twist.linear.x = self.line_speed
+            twist.angular.z = self.steer
+            self.cmd_pub.publish(twist)
 
-                    # [회피 논리] 오른쪽 빨강 많음 -> 왼쪽 회전 / 왼쪽 빨강 많음 -> 오른쪽 회전
-                    error = right_mass - left_mass
+        except Exception as e:
+            rospy.logerr(f"Image Processing Error: {e}")
+
+    # ---------------------------------------------------------
+    # 2. LiDAR 콜백 (모드 전환 + 장애물 회피 + 후진)
+    # ---------------------------------------------------------
+    def scan_callback(self, msg):
+        # A. 후진(RECOVER) 모드 처리
+        if self.mode == "RECOVER":
+            if rospy.Time.now().to_sec() - self.recover_start_time > self.recover_duration:
+                rospy.loginfo("[RECOVER] Done. Go Gap.")
+                self.mode = "GAP"
+            else:
+                twist = Twist()
+                twist.linear.x = -0.2
+                rot = self.recover_rot_speed
+                # 부딪힌 반대 방향으로 회전하며 후진
+                twist.angular.z = rot if self.recover_dir == -1 else -rot
+                self.cmd_pub.publish(twist)
+            return
+
+        ranges = msg.ranges
+        angle_min = msg.angle_min
+        angle_inc = msg.angle_increment
+        
+        front_min = 10.0
+        path_clear_dist = 10.0
+        left_corner_min = 10.0
+        right_corner_min = 10.0
+        scan_data = []
+
+        for i, r in enumerate(ranges):
+            if np.isinf(r) or r < 0.1: continue
+            
+            raw_angle = angle_min + i * angle_inc
+            robot_angle = raw_angle 
+            
+            deg = math.degrees(robot_angle)
+
+            # 1. 정면 트리거 데이터 수집 (+/- 10도)
+            if abs(deg) < 10:
+                if r < front_min: front_min = r
+                if r < path_clear_dist: path_clear_dist = r
+            
+            # 2. GAP 모드용 데이터 (뒤쪽 버림)
+            if abs(deg) > 90: continue
+            
+            # 시야각 필터
+            if self.view_limit_right < deg < self.view_limit_left:
+                scan_data.append((robot_angle, min(r, 3.0)))
+
+            # 벽과의 거리 계산 (y축 거리)
+            oy = r * math.sin(robot_angle)
+            if abs(oy) > self.wall_ignore_y: continue
+
+            # 코너 충돌 감지
+            if 20 < deg < 60:
+                if r < left_corner_min: left_corner_min = r
+            elif -60 < deg < -20:
+                if r < right_corner_min: right_corner_min = r
+
+        # B. 모드 전환 로직 (LINE -> GAP)
+        if self.mode == "LINE":
+            if front_min < self.trigger_dist:
+                self.trigger_count += 1
+            else:
+                self.trigger_count = 0 # 연속 감지 끊기면 리셋
+
+            if self.trigger_count >= self.trigger_limit:
+                rospy.logwarn(f"!!! OBSTACLE CONFIRMED ({front_min:.2f}m) -> GAP MODE !!!")
+                self.mode = "GAP"
+                # 잠깐 정지 후 모드 전환
+                stop = Twist()
+                for _ in range(5): 
+                    self.cmd_pub.publish(stop)
+                    rospy.sleep(0.05)
+            
+            return # LINE 모드일 땐 여기서 종료 (LiDAR로 주행 안 함)
+
+        # C. GAP 모드 & 충돌 방지
+        current_safe_limit = self.corner_safe_dist_default
+        if path_clear_dist > 0.4: 
+            current_safe_limit = self.corner_safe_dist_narrow
+
+        if left_corner_min < current_safe_limit:
+            rospy.logwarn(f"!!! LEFT HIT ({left_corner_min:.2f}m) -> BACKUP !!!")
+            self.mode = "RECOVER"
+            self.recover_dir = 1
+            self.recover_start_time = rospy.Time.now().to_sec()
+            return
+        elif right_corner_min < current_safe_limit:
+            rospy.logwarn(f"!!! RIGHT HIT ({right_corner_min:.2f}m) -> BACKUP !!!")
+            self.mode = "RECOVER"
+            self.recover_dir = -1
+            self.recover_start_time = rospy.Time.now().to_sec()
+            return
+
+        # Gap Finding Algorithm
+        scan_data.sort(key=lambda x: x[0])
+        best_gap_center = 0.0
+        max_gap_len = 0
+        current_start = -1
+        current_len = 0
+        
+        for i in range(len(scan_data)):
+            _, dist = scan_data[i]
+            if dist > self.safe_dist:
+                if current_start == -1: current_start = i
+                current_len += 1
+            else:
+                if current_start != -1:
+                    if current_len > max_gap_len:
+                        max_gap_len = current_len
+                        s, e = current_start, i-1
+                        best_gap_center = scan_data[int((s+e)/2)][0]
+                    current_start = -1
+                    current_len = 0
                     
-                    steer = error * self.red_gain
-                    steer = float(np.clip(steer, -1.0, 1.0))
+        if current_start != -1 and current_len > max_gap_len:
+            s, e = current_start, len(scan_data)-1
+            best_gap_center = scan_data[int((s+e)/2)][0]
+            max_gap_len = current_len
 
-                    twist.linear.x = self.red_speed
-                    twist.angular.z = steer
-                    self.pub.publish(twist)
-                    return # 빨간색 처리했으므로 검은색 로직 실행 안함 (return)
-
-                # --------------------------------------------------
-                # [PRIORITY 2] 검은색 트랙 추종 (Code 2 로직 적용)
-                # --------------------------------------------------
-                
-                # 검은색 트랙 강조: THRESH_BINARY_INV + OTSU
-                # (검은색 라인이 흰색(255)으로 변환됨)
-                _, binary = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-                # 노이즈 제거 (Morphology)
-                kernel = np.ones((3, 3), np.uint8)
-                binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-                binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-                # 열별 픽셀 수 계산 (Column Sum)
-                mask_black = (binary > 0)
-                col_sum = np.sum(mask_black, axis=0)
-                max_val = int(np.max(col_sum)) if col_sum.size > 0 else 0
-
-                # 검은색 라인이 너무 적으면 -> 못 찾음 -> 제자리 회전 (라인 탐색)
-                if max_val < self.dark_min_pixels:
-                    twist.linear.x = 0.0
-                    twist.angular.z = self.search_spin_speed
-                    self.pub.publish(twist)
-                    return
-
-                # 유효한 열 후보 추출
-                threshold_val = max(self.dark_min_pixels, int(max_val * self.dark_col_ratio))
-                candidates = np.where(col_sum >= threshold_val)[0]
-
-                if candidates.size == 0:
-                    twist.linear.x = 0.0
-                    twist.angular.z = self.search_spin_speed
-                    self.pub.publish(twist)
-                    return
-
-                # 무게중심(Center of Mass) 계산 - 검은 라인의 중심 찾기
-                numerator = np.sum(candidates * col_sum[candidates])
-                denominator = np.sum(col_sum[candidates])
-                track_center_x = float(numerator / denominator)
-
-                # [추종 논리]
-                # 라인이 화면 중심보다 오른쪽(Positive offset) -> 오른쪽으로 회전해야 함 (-z)
-                # Code 2 로직: ang = -self.k_angle * offset
-                offset = track_center_x - center 
-                ang = -self.k_angle * offset
-                
-                # 조향값 제한 (-0.8 ~ 0.8)
-                ang = max(min(ang, 0.8), -0.8)
-
-                # 최종 주행 명령 발행
-                twist.linear.x = self.forward_speed
-                twist.angular.z = ang
-                self.pub.publish(twist)
-
-            except Exception as e:
-                rospy.logerr(f"Image Processing Error: {e}")
-
-    # ============================================================
-    # BACK MODE (수정 금지)
-    # ============================================================
-    def back_control(self):
         twist = Twist()
-        now = rospy.Time.now().to_sec()
+        # 충분한 갭이 발견되었을 때
+        if max_gap_len > 5:
+            twist.linear.x = self.gap_speed
+            twist.angular.z = self.gap_kp * best_gap_center
+            
+            # 코너가 가까우면 회피 가중치 부여
+            if right_corner_min < 0.40:
+                twist.angular.z += 0.3 
+            elif left_corner_min < 0.40:
+                twist.angular.z -= 0.3
 
-        if now - self.state_start < 1.4:
-            twist.linear.x = -0.24
-            twist.angular.z = 0.0
-            self.pub.publish(twist)
+            twist.angular.z = np.clip(twist.angular.z, -1.2, 1.2)
         else:
-            angle = self.find_gap_max()
-            angle = self.apply_escape_direction_logic(angle)
+            # 갈 곳이 없으면 제자리 회전 혹은 정지
+            twist.linear.x = 0.0
+            twist.angular.z = -0.6
+            
+        self.cmd_pub.publish(twist)
 
-            self.escape_angle = angle
-            self.state = "ESCAPE"
-            self.state_start = now
-
-    # ============================================================
-    # ESCAPE MODE (수정 금지)
-    # ============================================================
-    def escape_control(self):
-        twist = Twist()
-        now = rospy.Time.now().to_sec()
-
-        if now - self.state_start < 1.0:
-            twist.linear.x = 0.19
-            twist.angular.z = self.escape_angle * 1.3
-            self.pub.publish(twist)
-        else:
-            self.state = "LANE"
-
-    # ============================================================
-    # ESCAPE 방향 로직 (수정 금지)
-    # ============================================================
-    def apply_escape_direction_logic(self, angle):
-        if self.force_right_escape > 0:
-            self.force_right_escape -= 1
-            return 0.9
-
-        if angle < 0:
-            self.left_escape_count += 1
-            if self.left_escape_count >= 4:
-                self.force_right_escape = 2
-                self.left_escape_count = 0
-        else:
-            self.left_escape_count = 0
-        return angle
-
-    # ============================================================
-    # MAX GAP 탐색 (수정 금지)
-    # ============================================================
-    def find_gap_max(self):
-        if len(self.scan_ranges) == 0:
-            return 0.0
-
-        raw = np.array(self.scan_ranges)
-        ranges = np.concatenate([raw[-60:], raw[:60]])
-        ranges = np.where((ranges < 0.20) | np.isnan(ranges), 0.0, ranges)
-
-        idx = np.argmax(ranges)
-        max_dist = ranges[idx]
-
-        if max_dist < (self.robot_width + 0.10):
-            return 0.0
-
-        angle_deg = idx - 60
-        return angle_deg * np.pi / 180
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
-        LineTracerWithObstacleAvoidance()
+        LimoMissionIntegrated()
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
