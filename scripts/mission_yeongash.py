@@ -17,7 +17,7 @@ class LineTracerWithObstacleAvoidance:
         self.bridge = CvBridge()
 
         # 라인트레이싱 속도
-        self.speed = 0.15
+        self.speed = 0.2
 
         # 라이다 정보
         self.scan_ranges = []
